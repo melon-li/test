@@ -1,0 +1,190 @@
+#!/bin/bash
+trap ctl_c INT
+pid=`ps axu | grep $0| grep grep -v| grep color -v| awk -F" " '{print $2}'`
+
+function ctl_c(){
+    kill -9 $pid
+}
+
+GW='192.168.99.1'
+cmd=$0
+LOG='/var/'${cmd##*/}'/curtraffic.KB'
+if [[ "$1" != "" ]];then 
+    GW=$1
+fi
+
+function is_installed(){
+    flag=`whereis $1|awk -F":" '{print $2}'`
+    if [ "$flag" == "" ];then
+        return 1
+    fi
+    return 0
+}
+
+function checkout_env(){
+    is_installed ifstat
+    if [[ $? -eq 0 ]];then
+        echo "Tool ifstat is installed!"
+        return 0
+    fi
+    
+    is_installed apt
+    if [[ $? -eq 0 ]];then
+        sudo apt-get install -y ifstat 
+        return 0
+    fi
+    
+    
+    is_installed yum
+    if [[ $? -eq 0 ]];then
+        sudo yum install -y ifstat 
+        return 0
+    fi
+
+    echo "Error:apt/yum is not found!"
+    exit 1
+}
+
+eth_arr=()
+function checkout_satif(){
+    #fastly checkout
+    cnt=0
+    if [[ ${#eth_arr[*]} -ne 0 ]];then
+        for e in ${eth_arr[*]}
+        do
+            cnt=$(($cnt+1))
+            ping -w 1 -c 1 -I $e $GW 1>/dev/null 2>/dev/null
+            if [[ $? -ne 0 ]];then
+                break
+            fi
+        done
+    fi 
+    if [[ $cnt -eq ${#eth_arr[*]} ]];then
+        return 0
+    fi
+   
+    #slowly checkout
+    #lo=`ifconfig | grep "127.0.0.1" -B1|grep mtu|awk -F":" '{print $1}'`
+    eths=`ifconfig | grep mtu| grep grep -v| grep color -v|awk -F":" '{print $1}'`
+    if [[  "$eths" == "" ]];then
+        echo "ERROR: network interface is not found"
+        exit 1
+    fi
+
+    while [ 1 ]
+    do
+        for e in `echo $eths`
+        do
+            ping -w 1 -c 1 -I $e $GW 1>/dev/null 2>/dev/null
+            if [[ $? -eq 0 ]];then
+                eth_arr[${#eth_arr[*]}]=$e
+            fi
+        done
+        
+        if [[ ${#eth_arr[*]} -eq 0 ]];then
+            echo "ERROR,not find any interface connected to satellite link!"
+            echo -e "\tMaybe the IP for checking is wrong. Please input the IP again."
+           # echo -n ":"
+           # read GW
+           sleep 1
+        else
+            break
+        fi    
+    done
+
+}
+
+cur=0
+function get_current_traffic(){
+    dir=${LOG%/*}
+    echo $dir
+    if [ ! -d "$dir" ];then
+        sudo mkdir -p "$dir"
+        sudo touch $LOG
+        sudo chmod 777 $LOG
+        sudo echo "0" >$LOG
+        cur=0
+        return 0
+    fi
+    
+    if [ ! -f $LOG ];then 
+        sudo touch $LOG
+        sudo chmod 777 $LOG
+        sudo echo "0" >$LOG
+        cur=0
+        return 0
+    fi
+    cur=`cat $LOG`
+}
+
+
+cmd_arr=()
+statfile_arr=()
+nowstamp=`date +%s`
+function start_ifstat(){
+    cmd_arr=()
+    statfile_arr=()
+    dir=${LOG%/*}
+    for e in `echo ${eth_arr[*]}`
+    do
+        statfile="$dir/ifstat1.$e"
+        cmd="ifstat -t -i $e >$statfile" 
+        statfile_arr[${#statfile_arr[*]}]=$statfile
+        cmd_arr[${#cmd_arr[*]}]=$cmd
+        eval $cmd" &" 
+    done
+}
+
+function checkout_ifstat_datafile(){
+    for e in `echo ${statfile_arr[*]}`
+    do
+        size=`ls -trhl $e |awk -F" " '{print $5}'| awk -F"M" '{print $1}'`
+        if [[ 50 -lt $size ]];then
+            lines=`cat $e|wc -l`
+            now=`date -d @$nowstamp |awk -F" " ' {print $4}'`
+            grep $now -A$lines > "/tmp/tmp.txt"
+            mv "/tmp/tmp.txt" $e
+        fi
+    done
+}
+
+function cal_sattraffic(){
+    checkout_env
+    checkout_satif
+    get_current_traffic
+    start_ifstat
+
+    nowstamp=`date +%s`
+    nowstamp=$(($now-2))
+    while [ 1 ]
+    do
+       nowstamp=$(($nowstamp+1))
+       checkout_ifstat_datafile
+       #waiting for ifstat create traffic data
+        while [ 1 ]
+        do
+            time=`date +%s`
+            if [[ nowstamp -lt $time ]];
+                break
+            fi
+            sleep 0.2
+        done
+
+        sum=0
+        now=`date -d @$nowstamp |awk -F" " ' {print $4}'`
+        for e in `echo ${statfile_arr[*]}`
+        do
+            traffic=`grep "$now" $e| grep grep -v | grep color -v|awk -F" " '{print $2+$3}'`
+            if [[ "$traffic" == "" ]];then
+                traffic=0
+            fi
+            sum=`echo "scale=2;$traffic+$sum" |bc`
+        done
+        cur=`echo "scale=2;$cur+$sum"|bc`
+        echo "$cur" >$LOG
+        echo $cur
+        sleep 0.5
+    done
+}
+
+cal_sattraffic
